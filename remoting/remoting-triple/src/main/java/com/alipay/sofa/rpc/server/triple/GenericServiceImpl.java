@@ -18,10 +18,17 @@ package com.alipay.sofa.rpc.server.triple;
 
 import com.alipay.sofa.rpc.codec.Serializer;
 import com.alipay.sofa.rpc.codec.SerializerFactory;
+import com.alipay.sofa.rpc.common.cache.ReflectCache;
 import com.alipay.sofa.rpc.common.utils.ClassTypeUtils;
+import com.alipay.sofa.rpc.common.utils.ClassUtils;
+import com.alipay.sofa.rpc.config.ConfigUniqueNameGenerator;
 import com.alipay.sofa.rpc.config.ProviderConfig;
+import com.alipay.sofa.rpc.core.exception.RpcErrorType;
+import com.alipay.sofa.rpc.core.exception.SofaRpcException;
 import com.alipay.sofa.rpc.core.exception.SofaRpcRuntimeException;
 import com.alipay.sofa.rpc.core.request.SofaRequest;
+import com.alipay.sofa.rpc.core.response.SofaResponse;
+import com.alipay.sofa.rpc.invoke.Invoker;
 import com.alipay.sofa.rpc.log.Logger;
 import com.alipay.sofa.rpc.log.LoggerFactory;
 import com.alipay.sofa.rpc.tracer.sofatracer.TracingContextKey;
@@ -45,45 +52,75 @@ public class GenericServiceImpl extends SofaGenericServiceTriple.GenericServiceI
 
     private static final Logger LOGGER = LoggerFactory.getLogger(GenericServiceImpl.class);
 
-    protected Object            ref;
-    protected Class             proxyClass;
+    protected Invoker           invoker;
+    protected ProviderConfig    providerConfig;
 
-    public GenericServiceImpl(ProviderConfig providerConfig) {
+    public GenericServiceImpl(Invoker invoker, ProviderConfig providerConfig) {
         super();
-        ref = providerConfig.getRef();
-        proxyClass = providerConfig.getProxyClass();
-    }
-
-    public GenericServiceImpl(Object ref, Class proxyClass) {
-        super();
-        this.ref = ref;
-        this.proxyClass = proxyClass;
+        this.invoker = invoker;
+        this.providerConfig = providerConfig;
+        String key = ConfigUniqueNameGenerator.getUniqueName(providerConfig);
+        // 缓存接口的方法
+        for (Method m : providerConfig.getProxyClass().getMethods()) {
+            ReflectCache.putOverloadMethodCache(key, m);
+        }
     }
 
     @Override
     public void generic(Request request, StreamObserver<Response> responseObserver) {
 
-        SofaRequest sofaRequest = TracingContextKey.getKeySofaRequest().get(Context.current());
+        ClassLoader oldClassLoader = Thread.currentThread().getContextClassLoader();
 
+        SofaRequest sofaRequest = TracingContextKey.getKeySofaRequest().get(Context.current());
         String methodName = sofaRequest.getMethodName();
-        Class[] argTypes = getArgTypes(request);
         try {
+            String key = ConfigUniqueNameGenerator.getUniqueName(providerConfig);
+            ClassLoader interfaceClassLoader = providerConfig.getProxyClass().getClassLoader();
+            Thread.currentThread().setContextClassLoader(interfaceClassLoader);
+
+            Class[] argTypes = getArgTypes(request);
             Serializer serializer = SerializerFactory.getSerializer(request.getSerializeType());
 
-            Method declaredMethod = proxyClass.getDeclaredMethod(methodName, argTypes);
-            Object result = declaredMethod.invoke(ref, getInvokeArgs(request, argTypes, serializer));
+            Method declaredMethod = ReflectCache.getOverloadMethodCache(key, methodName, request.getArgTypesList()
+                .toArray(new String[0]));
+            Object[] invokeArgs = getInvokeArgs(request, argTypes, serializer);
+
+            // fill sofaRequest
+            sofaRequest.setMethod(declaredMethod);
+            sofaRequest.setMethodArgs(invokeArgs);
+            sofaRequest.setMethodArgSigs(ClassTypeUtils.getTypeStrs(argTypes, true));
+
+            SofaResponse response = invoker.invoke(sofaRequest);
+            Object ret = getAppResponse(declaredMethod, response);
 
             Response.Builder builder = Response.newBuilder();
             builder.setSerializeType(request.getSerializeType());
             builder.setType(declaredMethod.getReturnType().getName());
-            builder.setData(ByteString.copyFrom(serializer.encode(result, null).array()));
+            builder.setData(ByteString.copyFrom(serializer.encode(ret, null).array()));
             Response build = builder.build();
             responseObserver.onNext(build);
             responseObserver.onCompleted();
         } catch (Exception e) {
             LOGGER.error("Invoke " + methodName + " error:", e);
             throw new SofaRpcRuntimeException(e);
+        } finally {
+            Thread.currentThread().setContextClassLoader(oldClassLoader);
         }
+    }
+
+    private Object getAppResponse(Method method, SofaResponse response) {
+        if (response.isError()) {
+            throw new SofaRpcException(RpcErrorType.SERVER_UNDECLARED_ERROR, response.getErrorMsg());
+        }
+        Object ret = response.getAppResponse();
+        if (ret instanceof Throwable) {
+            throw new SofaRpcRuntimeException((Throwable) ret);
+        } else {
+            if (ret == null) {
+                ret = ClassUtils.getDefaultPrimitiveValue(method.getReturnType());
+            }
+        }
+        return ret;
     }
 
     private Class[] getArgTypes(Request request) {

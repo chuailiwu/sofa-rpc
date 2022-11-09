@@ -19,8 +19,10 @@ package com.alipay.sofa.rpc.server.triple;
 import com.alipay.sofa.rpc.codec.Serializer;
 import com.alipay.sofa.rpc.codec.SerializerFactory;
 import com.alipay.sofa.rpc.codec.sofahessian.SofaHessianSerializer;
+import com.alipay.sofa.rpc.config.ConfigUniqueNameGenerator;
 import com.alipay.sofa.rpc.config.ProviderConfig;
 import com.alipay.sofa.rpc.core.request.SofaRequest;
+import com.alipay.sofa.rpc.filter.ProviderInvoker;
 import com.alipay.sofa.rpc.message.MessageBuilder;
 import com.alipay.sofa.rpc.tracer.sofatracer.TracingContextKey;
 import com.alipay.sofa.rpc.transport.ByteArrayWrapperByteBuf;
@@ -45,17 +47,22 @@ public class GenericServiceImplTest {
     private GenericServiceImpl                  genericService;
     private MockStreamObserver<triple.Response> responseObserver;
 
+    private ProviderConfig<HelloService>        providerConfig;
+
     public GenericServiceImplTest(){
-        ProviderConfig<HelloService> providerConfig = new ProviderConfig<>();
+        providerConfig = new ProviderConfig<>();
         providerConfig.setRef(new HelloServiceImpl());
-        providerConfig.setProxyClass(HelloService.class);
-        genericService = new GenericServiceImpl(providerConfig.getRef(),providerConfig.getProxyClass());
+        providerConfig.setInterfaceId(HelloService.class.getName());
+        ProviderInvoker<HelloService> invoker = new ProviderInvoker<>(providerConfig);
+        genericService = new GenericServiceImpl(invoker,providerConfig);
         responseObserver = new MockStreamObserver<>();
     }
 
     @Test
     public void testPrimitiveType() throws NoSuchMethodException {
         // test return primitive type
+        Assert.assertEquals("com.alipay.sofa.rpc.server.triple.HelloService:1.0",
+            ConfigUniqueNameGenerator.getUniqueName(providerConfig));
 
         String methodName = "testPrimitiveType";
         Method method = HelloService.class.getDeclaredMethod(methodName, long.class);
